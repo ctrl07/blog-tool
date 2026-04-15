@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Blog Content Extractor - Simplified with Playwright Only
-Extracts blog posts and converts to WordPress XML using only the best tool.
+Blog Content Extractor
+Extracts blog posts from URLs and converts to WordPress XML.
 """
 
 __version__ = "1.0.0"
 
 # Standard library imports
-import asyncio
 import csv
 import hashlib
 import html
@@ -15,22 +14,14 @@ import io
 import json
 import logging
 import os
-import random
 import re
-import sys
 import time
-import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, cast
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 from urllib.parse import urljoin, urlparse
 
-if TYPE_CHECKING:
-    from playwright.async_api import Browser, BrowserContext, Playwright
-
 # Third-party imports
-import aiofiles
-import aiohttp
 import filetype
 import requests
 import validators
@@ -43,24 +34,10 @@ except ImportError:
     print("ERROR: BeautifulSoup4 is required. Install with: pip install beautifulsoup4")
     raise
 
-# Check if Playwright is available (both sync and async)
-async_playwright: Optional[Any] = None
-sync_playwright: Optional[Any] = None
-
 try:
-    from playwright.async_api import async_playwright as _async_pw
-    async_playwright = _async_pw
-    HAS_ASYNC_PLAYWRIGHT = True
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    HAS_ASYNC_PLAYWRIGHT = False
-
-try:
-    from playwright.sync_api import sync_playwright as _sync_pw
-    sync_playwright = _sync_pw
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
-    print("WARNING: Playwright not available. Some features may not work.")
+    raise ImportError("playwright is required. Install with: pip install playwright && playwright install chromium")
 
 # Configuration constants
 URLS_FILE = "urls.txt"
@@ -77,22 +54,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def setup_windows_environment() -> None:
-    """
-    Configure Windows-specific environment settings for asyncio and Playwright.
-
-    This function MUST be called before importing blog_extractor in Windows environments
-    to prevent subprocess handling errors and resource warnings.
-
-    Per CLAUDE.md: This setup was moved from module-level to avoid side effects when
-    blog_extractor.py is imported as a library.
-    """
-    if sys.platform.startswith('win'):
-        # Windows uses ProactorEventLoop by default (since Python 3.8) for subprocess support
-        # Suppress Playwright subprocess cleanup warnings on Windows
-        warnings.filterwarnings("ignore", category=ResourceWarning)
-
-
 class BlogExtractor:
     """Simplified blog extractor using only Playwright for all JavaScript-heavy sites"""
 
@@ -105,8 +66,8 @@ class BlogExtractor:
         relative_links: bool = False,
         include_images: bool = True,
         skip_duplicates: bool = True,
-        download_images: bool = True,
-        skip_playwright: bool = False
+        download_images: bool = False,
+        cdp_url: str = "http://localhost:9222",
     ):
         self.urls_file = urls_file
         self.output_dir = output_dir
@@ -117,14 +78,10 @@ class BlogExtractor:
         self.include_images = include_images  # Include images in exported content
         self.skip_duplicates = skip_duplicates  # Skip duplicate content (default True)
         self.download_images = download_images  # Download images locally instead of using external URLs
-        self.skip_playwright = skip_playwright  # Fast mode - skip Playwright for WordPress/static sites
+        self.cdp_url = cdp_url  # Chrome CDP endpoint (must be running with --remote-debugging-port)
         self.seen_hashes: Set[str] = set()  # For duplicate detection
         self.resolved_image_cache: Dict[str, str] = {}  # Cache for resolved image URLs
         self.downloaded_images: Dict[str, str] = {}  # Map original URL -> local file path
-        # Shared Playwright browser for async concurrent mode (reduces overhead)
-        self._playwright: Optional['Playwright'] = None
-        self._browser: Optional['Browser'] = None
-        self._context: Optional['BrowserContext'] = None
 
         # Create output directory if it doesn't exist
         Path(self.output_dir).mkdir(exist_ok=True)
@@ -134,11 +91,6 @@ class BlogExtractor:
         if self.download_images:
             Path(self.images_dir).mkdir(exist_ok=True)
 
-        # User agents for variety
-        self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        ]
 
     def _log(self, level: str, message: str) -> None:
         """Log message to logger and optionally call callback for UI updates"""
@@ -159,111 +111,9 @@ class BlogExtractor:
                 # Fallback: encode with error replacement for console display
                 print(message.encode('ascii', errors='replace').decode('ascii'))
 
-    async def _get_or_create_browser(self) -> Any:
-        """Lazily initialize shared async browser instance for concurrent mode"""
-        if self._browser is None and HAS_ASYNC_PLAYWRIGHT and async_playwright is not None:
-            self._playwright = await async_playwright().start()
-            if self._playwright is not None:
-                self._browser = await self._playwright.chromium.launch(headless=True)
-        return self._browser
-
-    async def _get_or_create_context(self) -> Any:
-        """Get or create browser context with random user agent"""
-        if self._context is None:
-            browser = await self._get_or_create_browser()
-            if browser:
-                self._context = await browser.new_context(
-                    user_agent=random.choice(self.user_agents),
-                    viewport={'width': 1920, 'height': 1080}
-                )
-        return self._context
-
-    async def close_browser(self) -> None:
-        """Close shared browser instance - call this at end of concurrent processing"""
-        try:
-            if self._context:
-                await self._context.close()
-                self._context = None
-            if self._browser:
-                await self._browser.close()
-                self._browser = None
-            if self._playwright:
-                await self._playwright.stop()
-                self._playwright = None
-            # Give asyncio time to cleanup pipes on Windows
-            await asyncio.sleep(0.1)
-        except Exception:
-            # Suppress Windows asyncio cleanup warnings (harmless)
-            pass
-
-
     def get_content_hash(self, content: str) -> str:
         """Generate blake2s hash of content for duplicate detection (FIPS-compliant)"""
         return hashlib.blake2s(content.encode('utf-8')).hexdigest()
-
-    def _quick_platform_check(self, url: str) -> Optional[str]:
-        """Quick platform detection using basic requests (no Playwright) - FAST!
-
-        Returns platform name or None if detection fails.
-        This is used to determine if Playwright is needed before wasting time on heavy rendering.
-        """
-        try:
-            # Quick HEAD request first to check accessibility
-            head_response = requests.head(url, timeout=5, allow_redirects=True)
-
-            # If HEAD fails, try GET but with minimal timeout
-            if head_response.status_code >= 400:
-                response = requests.get(url, timeout=10)
-            else:
-                response = requests.get(url, timeout=10)
-
-            response.raise_for_status()
-            html = response.text
-
-            # Quick platform detection from HTML markers
-            html_lower = html.lower()
-
-            # JavaScript-heavy platforms (NEED Playwright)
-            if 'wix.com' in html_lower or 'data-hook=' in html or '_wix' in html_lower:
-                return 'wix'
-            if 'webflow.com' in html_lower or 'data-wf-domain' in html or 'data-wf-page' in html:
-                return 'webflow'
-            if 'blog__article__content__text' in html or 'dealer-content' in html_lower:
-                # DealerOn/DealerInspire - Angular/JavaScript heavy
-                return 'dealeron'
-
-            # Static platforms (DON'T need Playwright)
-            if 'wp-content' in html_lower or 'wordpress' in html_lower or 'wp-includes' in html_lower:
-                return 'wordpress'
-            if 'blogger.com' in html_lower or 'blogspot.com' in html_lower:
-                return 'blogger'
-            if 'medium.com' in html_lower:
-                return 'medium'
-            if 'squarespace' in html_lower:
-                return 'squarespace'
-
-            # Generic/unknown - assume static (most sites are)
-            return 'generic'
-
-        except Exception as e:
-            self._log("debug", f"  Quick platform check failed: {e}")
-            return None
-
-    def _needs_javascript_rendering(self, platform: Optional[str]) -> bool:
-        """Determine if a platform needs JavaScript rendering (Playwright)
-
-        Returns:
-            True if Playwright needed (JS-heavy site)
-            False if requests library is sufficient (static site)
-        """
-        if platform is None:
-            # Unknown platform - be safe and use Playwright
-            return True
-
-        # Platforms that REQUIRE Playwright (JavaScript-heavy)
-        js_heavy_platforms = {'wix', 'webflow', 'dealeron', 'dealerinspire'}
-
-        return platform.lower() in js_heavy_platforms
 
     def detect_platform(self, soup: BeautifulSoup) -> str:
         """Detect the blog platform from HTML structure"""
@@ -318,333 +168,81 @@ class BlogExtractor:
         self._log("info", "  Platform: Generic (no specific platform detected)")
         return 'generic'
 
-    def fetch_content(self, url: str, max_retries: int = 3) -> Optional[str]:
-        """Fetch URL content with SMART platform detection - skips Playwright for static sites!
-
-        Performance optimization: Quickly detects platform type first, then:
-        - Static sites (WordPress, Blogger, etc.) → requests library (5-10x faster!)
-        - JavaScript-heavy sites (Wix, Webflow, DealerOn) → Playwright
-        """
-        # STEP 1: Quick platform detection (5-10 seconds) to determine method
-        self._log("info", "  Detecting platform type...")
-        platform = self._quick_platform_check(url)
-        needs_js = self._needs_javascript_rendering(platform)
-
-        if platform:
-            if needs_js:
-                self._log("info", f"  Platform: {platform} (JavaScript-heavy → using Playwright)")
-            else:
-                self._log("info", f"  Platform: {platform} (static HTML → using requests for speed)")
-
-        # STEP 2: If static site, skip Playwright entirely and use requests
-        if not needs_js:
-            self._log("info", "  Fetching with requests library (fast path)...")
-            for attempt in range(max_retries):
-                try:
-                    response = requests.get(
-                        url,
-                        headers={'User-Agent': random.choice(self.user_agents)},
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    return response.text
-                except Exception as e:
-                    self._log("warning", f"  Requests attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt
-                        self._log("info", f"  Retrying in {delay} seconds...")
-                        time.sleep(delay)
-
-            # If requests failed, fall through to try Playwright anyway
-            self._log("warning", "  Requests failed, falling back to Playwright...")
-
-        # STEP 3: Try Playwright for JavaScript-heavy sites (or if requests failed)
-        if HAS_PLAYWRIGHT and sync_playwright is not None:
-            for attempt in range(max_retries):
-                try:
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(headless=True)
-                        try:
-                            context = browser.new_context(
-                                user_agent=random.choice(self.user_agents),
-                                viewport={'width': 1920, 'height': 1080}
-                            )
-                            page = context.new_page()
-
-                            # Navigate and wait for page load (optimized timeout)
-                            self._log("info", f"  Fetching with Playwright (attempt {attempt + 1}/{max_retries})...")
-                            # wait_until='load' ensures page is fully loaded
-                            page.goto(url, wait_until='load', timeout=45000)  # 45s (was 120s) - faster!
-
-                            # Wait for blog content to render (Angular SPA)
-                            try:
-                                page.wait_for_selector('div.blog__article__content__text, article, .blog-post', timeout=15000)  # 15s (was 30s)
-                            except Exception as e:
-                                # Continue anyway, content might use different selector
-                                self._log("debug", f"  Selector wait failed (expected): {e}")
-                            page.wait_for_timeout(500)  # Brief wait for dynamic content
-
-                            # OPTIMIZED SCROLLING: Faster but still loads all images
-                            self._log("info", "  Scrolling to load all images (15-20 seconds)...")
-
-                            # Scroll to 25% of page
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.25)")
-                            page.wait_for_load_state('networkidle', timeout=8000)  # 8s (was 20s)
-
-                            # Scroll to 50% of page
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
-                            page.wait_for_load_state('networkidle', timeout=8000)
-
-                            # Scroll to 75% of page
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.75)")
-                            page.wait_for_load_state('networkidle', timeout=8000)
-
-                            # Scroll to bottom
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            page.wait_for_load_state('networkidle', timeout=8000)
-                            page.wait_for_timeout(500)  # Brief wait for final images
-
-                            # Scroll back to top
-                            page.evaluate("window.scrollTo(0, 0)")
-                            page.wait_for_timeout(500)
-
-                            # Get page content
-                            html_content = cast(str, page.content())
-                            return html_content
-                        finally:
-                            # Always cleanup browser resources, even on error
-                            browser.close()
-
-                except Exception as e:
-                    self._log("warning", f"  Playwright attempt {attempt + 1} failed: {e}")
-
-                    if attempt < max_retries - 1:
-                        # Exponential backoff: 2^attempt seconds (1s, 2s, 4s)
-                        delay = 2 ** attempt
-                        self._log("info", f"  Retrying in {delay} seconds...")
-                        time.sleep(delay)
-                    else:
-                        self._log("info", "  All Playwright attempts failed, falling back to requests...")
-
-        # Fallback to requests (for Streamlit Cloud compatibility)
-        for attempt in range(max_retries):
-            try:
-                headers = {
-                    'User-Agent': random.choice(self.user_agents),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                }
-
-                self._log("info", f"  Fetching with requests (attempt {attempt + 1}/{max_retries})...")
-                response = requests.get(url, headers=headers, timeout=30)
-                response.raise_for_status()
-                return response.text
-
-            except Exception as e:
-                self._log("warning", f"  Requests attempt {attempt + 1} failed: {e}")
-
-                if attempt < max_retries - 1:
-                    # Exponential backoff
-                    delay = 2 ** attempt
-                    self._log("info", f"  Retrying in {delay} seconds...")
-                    time.sleep(delay)
-                else:
-                    self._log("error", f"  All attempts failed for {url}")
-
-        return None
-
-    async def fetch_content_async(self, url: str, max_retries: int = 3) -> Optional[str]:
-        """Async version: Fetch URL content with optional Playwright skip (fast mode)"""
-        if not HAS_ASYNC_PLAYWRIGHT or async_playwright is None:
-            # Fall back to synchronous version if async not available
-            return self.fetch_content(url, max_retries)
-
-        # FAST MODE: If skip_playwright is True, try aiohttp first (truly async!)
-        # But fall back to Playwright if site blocks requests (403, etc.)
-        if self.skip_playwright:
-            self._log("info", "  Fast mode: Trying aiohttp first...")
-            for attempt in range(max_retries):
-                try:
-                    # Use aiohttp for TRUE async requests
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            url,
-                            headers={'User-Agent': random.choice(self.user_agents)},
-                            timeout=aiohttp.ClientTimeout(total=30)
-                        ) as response:
-                            response.raise_for_status()
-                            text = await response.text()
-                            self._log("info", "  Fast mode succeeded with aiohttp!")
-                            return text
-                except Exception as e:
-                    self._log("warning", f"  Aiohttp attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt
-                        self._log("info", f"  Retrying in {delay} seconds...")
-                        await asyncio.sleep(delay)
-
-            # Requests failed - fall back to Playwright (site probably has bot protection)
-            self._log("warning", "  Fast mode blocked by site - falling back to Playwright...")
-            # Continue to Playwright below instead of returning None
-
-        # NORMAL MODE: Smart platform detection (if not in fast mode)
-        # STEP 1: Quick platform detection to determine method
-        self._log("info", "  Detecting platform type...")
-        platform = self._quick_platform_check(url)  # Still uses sync requests (fast)
-        needs_js = self._needs_javascript_rendering(platform)
-
-        if platform:
-            if needs_js:
-                self._log("info", f"  Platform: {platform} (JavaScript-heavy → using Playwright)")
-            else:
-                self._log("info", f"  Platform: {platform} (static HTML → using requests for speed)")
-
-        # STEP 2: If static site, skip Playwright and use async HTTP
-        if not needs_js:
-            self._log("info", "  Fetching with aiohttp (fast async path)...")
-            for attempt in range(max_retries):
-                try:
-                    # Use aiohttp for TRUE async requests (enables real concurrency!)
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            url,
-                            headers={'User-Agent': random.choice(self.user_agents)},
-                            timeout=aiohttp.ClientTimeout(total=30)
-                        ) as response:
-                            response.raise_for_status()
-                            return await response.text()
-                except Exception as e:
-                    self._log("warning", f"  Aiohttp attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt
-                        self._log("info", f"  Retrying in {delay} seconds...")
-                        await asyncio.sleep(delay)
-
-            # If aiohttp failed, fall through to Playwright
-            self._log("warning", "  Aiohttp failed, falling back to Playwright...")
-
-        # STEP 3: Try async Playwright for JavaScript-heavy sites (or if requests failed)
+    def fetch_content(self, url: str, max_retries: int = 3,
+                      scroll_interval: int = 600,
+                      settle_delay: int = 5000) -> Optional[str]:
+        """Fetch URL content via CDP — all requests go through the running Chrome instance."""
         for attempt in range(max_retries):
             page = None
             try:
-                # Create fresh browser for each request (more stable)
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
-                    context = await browser.new_context(
-                        user_agent=random.choice(self.user_agents),
-                        viewport={'width': 1920, 'height': 1080}
-                    )
-                    try:
-                        page = await context.new_page()
+                with sync_playwright() as p:
+                    self._log("info", f"  Connecting to Chrome via CDP at {self.cdp_url} (attempt {attempt + 1}/{max_retries})...")
+                    browser = p.chromium.connect_over_cdp(self.cdp_url)
+                    context = browser.contexts[0]
+                    page = context.new_page()
+                    page.set_viewport_size({"width": 1920, "height": 1080})
 
-                        # Navigate and wait for page load (optimized timeout)
-                        self._log("info", f"  Fetching with Playwright async (attempt {attempt + 1}/{max_retries})...")
-                        # wait_until='load' ensures page is fully loaded
-                        await page.goto(url, wait_until='load', timeout=45000)  # 45s (was 120s) - faster!
+                    # Bring tab to front and navigate
+                    page.bring_to_front()
+                    page.goto(url, wait_until="commit", timeout=30000)
 
-                        # Wait for blog content to render (Angular SPA)
-                        try:
-                            await page.wait_for_selector('div.blog__article__content__text, article, .blog-post', timeout=15000)  # 15s (was 30s)
-                        except Exception as e:
-                            # Continue anyway, content might use different selector
-                            self._log("debug", f"  Selector wait failed (expected): {e}")
-                        await page.wait_for_timeout(500)  # Brief wait for dynamic content
+                    # Use screen CSS so layout/colours render as seen in browser
+                    page.emulate_media(media="screen")
 
-                        # OPTIMIZED SCROLLING: Faster but still loads all images
-                        self._log("info", "  Scrolling to load all images (15-20 seconds)...")
+                    # Scroll to trigger lazy-loaded images (JS interval — same as miniwayback)
+                    self._log("info", "  Scrolling to load lazy images...")
+                    page.evaluate(f"""
+                        async () => {{
+                            await new Promise(resolve => {{
+                                const distance = window.innerHeight;
+                                let count = 0;
+                                const timer = setInterval(() => {{
+                                    window.scrollBy(0, distance);
+                                    count++;
+                                    const atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight;
+                                    if (atBottom && count >= 2) {{
+                                        clearInterval(timer);
+                                        window.scrollTo(0, 0);
+                                        resolve();
+                                    }}
+                                }}, {scroll_interval});
+                            }});
+                        }}
+                    """)
 
-                        # Scroll to 25% of page
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.25)")
-                        await page.wait_for_load_state('networkidle', timeout=8000)  # 8s (was 20s)
+                    # Wait for dynamic content to settle
+                    self._log("info", f"  Waiting {settle_delay // 1000}s for page to settle...")
+                    page.wait_for_timeout(settle_delay)
 
-                        # Scroll to 50% of page
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
-                        await page.wait_for_load_state('networkidle', timeout=8000)
-
-                        # Scroll to 75% of page
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.75)")
-                        await page.wait_for_load_state('networkidle', timeout=8000)
-
-                        # Scroll to bottom
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_load_state('networkidle', timeout=8000)
-                        await page.wait_for_timeout(500)  # Brief wait for final images
-
-                        # Scroll back to top
-                        await page.evaluate("window.scrollTo(0, 0)")
-                        await page.wait_for_timeout(500)
-
-                        # Get page content
-                        html_content = cast(str, await page.content())
-                        return html_content
-                    finally:
-                        # Clean up browser resources
-                        if page:
-                            await page.close()
-                        await browser.close()
+                    html_content = cast(str, page.content())
+                    return html_content
 
             except Exception as e:
-                self._log("warning", f"  Async Playwright attempt {attempt + 1} failed: {e}")
-
+                self._log("warning", f"  CDP attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-                    # Exponential backoff: 2^attempt seconds (1s, 2s, 4s)
                     delay = 2 ** attempt
-                    self._log("info", f"  Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
+                    self._log("info", f"  Retrying in {delay}s...")
+                    time.sleep(delay)
                 else:
-                    self._log("error", f"  All async attempts failed for {url}")
+                    self._log("error", f"  All CDP attempts failed for {url}")
+            finally:
+                if page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
 
         return None
 
     def extract_categories(self, soup: BeautifulSoup) -> List[str]:
         """Extract categories - only from blog-specific areas, not navigation"""
-        # DealerInspire - div.meta-below-content with rel="category tag" links (Speck Buick GMC)
+        categories: set = set()
+
+        # DealerInspire - div.meta-below-content
         meta_below = soup.select_one('div.meta-below-content')
         if meta_below:
-            category_links = meta_below.find_all('a', rel='category tag')
-            if category_links:
-                categories = set()
-                for elem in category_links:
-                    if isinstance(elem, Tag):
-                        cat = elem.get_text().strip()
-                        if cat:
-                            categories.add(cat)
-                return list(categories)
-
-        # Priority Honda/DealerOn: Look for categories ONLY within blog entry area
-        blog_entry = soup.select_one('div.blog__entry')
-        if blog_entry:
-            # Only look for categories within the blog entry container
-            category_elements = blog_entry.select('div.blog__entry__content__categories a')
-            if category_elements:
-                categories = set()
-                for elem in category_elements:
-                    if isinstance(elem, Tag):
-                        cat = elem.get_text().strip()
-                        if cat:
-                            categories.add(cat)
-                return list(categories)
-
-        # Great Lakes Subaru / DealerOn v2 - div.categories structure
-        categories_div = soup.select_one('div.categories')
-        if categories_div:
-            category_links = categories_div.find_all('a')
-            if category_links:
-                categories = set()
-                for elem in category_links:
-                    if isinstance(elem, Tag):
-                        cat = elem.get_text().strip()
-                        if cat:
-                            categories.add(cat)
-                return list(categories)
-
-        # WordPress - category links with rel="category tag" (Earnhardt Hyundai, etc.)
-        category_tag_links = soup.find_all('a', rel='category tag')
-        if category_tag_links:
-            categories = set()
-            for elem in category_tag_links:
+            # rel is a multi-valued attribute stored as a list by BS4 — check with lambda
+            for elem in meta_below.find_all('a', rel=lambda r: r and 'category' in r):
                 if isinstance(elem, Tag):
                     cat = elem.get_text().strip()
                     if cat:
@@ -652,89 +250,125 @@ class BlogExtractor:
             if categories:
                 return list(categories)
 
-        # Wix-specific selectors (very targeted)
-        wix_selectors = [
-            'ul[aria-label="Post categories"] a',
-            'section ul.pRGtWE li a',
-        ]
-
-        categories = set()
-        for selector in wix_selectors:
-            elements = soup.select(selector)
-            for element in elements:
-                if isinstance(element, Tag):
-                    cat = element.get_text().strip()
+        # Priority Honda/DealerOn - within blog entry container
+        blog_entry = soup.select_one('div.blog__entry')
+        if blog_entry:
+            for elem in blog_entry.select('div.blog__entry__content__categories a'):
+                if isinstance(elem, Tag):
+                    cat = elem.get_text().strip()
                     if cat:
                         categories.add(cat)
+            if categories:
+                return list(categories)
 
-        # Meta tag fallback - ONLY use article-specific meta tags
-        # IMPORTANT: We explicitly DO NOT use meta[name="keywords"] because it contains
-        # site-wide SEO keywords (e.g., "Honda Dealer") that are NOT blog categories
-        meta = soup.select_one('meta[name="article:section"]')
-        if meta and isinstance(meta, Tag):
-            content = meta.get('content')
-            if content:
-                cat = str(content).strip()
+        # DealerOn v2
+        categories_div = soup.select_one('div.categories')
+        if categories_div:
+            for elem in categories_div.find_all('a'):
+                if isinstance(elem, Tag):
+                    cat = elem.get_text().strip()
+                    if cat:
+                        categories.add(cat)
+            if categories:
+                return list(categories)
+
+        # WordPress standard — rel="category tag" (BS4 stores rel as list, use lambda)
+        for elem in soup.find_all('a', rel=lambda r: r and 'category' in r):
+            if isinstance(elem, Tag):
+                cat = elem.get_text().strip()
                 if cat:
                     categories.add(cat)
 
-        # Filter out navigation/dealer terms
+        # WordPress common CSS patterns
+        for selector in [
+            '.cat-links a',
+            '.entry-categories a',
+            '.post-categories a',
+            '.categories-links a',
+            'span.cat-links a',
+        ]:
+            for elem in soup.select(selector):
+                if isinstance(elem, Tag):
+                    cat = elem.get_text().strip()
+                    if cat:
+                        categories.add(cat)
+
+        # Wix
+        for selector in ['ul[aria-label="Post categories"] a', 'section ul.pRGtWE li a']:
+            for elem in soup.select(selector):
+                if isinstance(elem, Tag):
+                    cat = elem.get_text().strip()
+                    if cat:
+                        categories.add(cat)
+
+        # Meta fallback (article:section)
+        meta = soup.select_one('meta[name="article:section"], meta[property="article:section"]')
+        if meta and isinstance(meta, Tag):
+            content = meta.get('content')
+            if content:
+                categories.add(str(content).strip())
+
+        # Filter noise
         exclude_terms = [
             'uncategorized', 'blog', 'all posts', 'home', 'about', 'contact',
             'dealer', 'dealership', 'inventory', 'service', 'parts', 'hours',
             'location', 'directions', 'finance', 'specials', 'reviews',
             'privacy', 'sitemap', 'careers', 'testimonials', 'team',
             'new inventory', 'used inventory', 'schedule service', 'financing',
-            'honda', 'roanoke', 'priority'  # Brand/location terms
         ]
-
-        filtered_categories = []
-        for cat in categories:
-            cat_lower = cat.lower()
-            # Exclude if any exclude term is in the category
-            is_excluded = any(term in cat_lower for term in exclude_terms)
-            # Also exclude if it looks like a URL or link text
-            if not is_excluded and len(cat.split()) <= 3 and 'http' not in cat_lower:
-                filtered_categories.append(cat)
-
-        return filtered_categories
+        return [
+            cat for cat in categories
+            if not any(t in cat.lower() for t in exclude_terms)
+            and len(cat.split()) <= 5
+            and 'http' not in cat.lower()
+        ]
 
     def extract_tags(self, soup: BeautifulSoup) -> List[str]:
         """Extract tags from blog-specific areas only"""
-        selectors = [
-            # Priority Honda/DealerOn-specific selectors
+        tags: set = set()
+
+        # WordPress standard — rel="tag" (BS4 stores rel as list, use lambda)
+        for elem in soup.find_all('a', rel=lambda r: r and 'tag' in r and 'category' not in r):
+            if isinstance(elem, Tag):
+                tag = elem.get_text().strip()
+                if tag:
+                    tags.add(tag)
+
+        # WordPress common CSS patterns
+        for selector in [
+            '.tags-links a',
+            '.entry-tags a',
+            '.post-tags a',
+            'span.tags-links a',
+            # DealerOn
             'ul.blog__entry__content__tags li a',
-            'ul.blog__entry__content__tags li a strong',
-            # Wix-specific selectors based on your HTML
+            # Wix
             'nav[aria-label="Tags"] ul li a',
             '.zmug2R li a',
             '._u2fqx',
-            # Generic fallbacks
+            # Generic
             '.tag a',
             '.tags a',
-            # NOTE: We do NOT use meta[name="keywords"] as it contains site-wide SEO terms
-            # (e.g., "Honda Dealer") that are NOT blog post tags
-        ]
-
-        tags = set()
-        for selector in selectors:
-            elements = soup.select(selector)
-            for element in elements:
-                if isinstance(element, Tag):
-                    tag = element.get_text().strip()
+        ]:
+            for elem in soup.select(selector):
+                if isinstance(elem, Tag):
+                    tag = elem.get_text().strip()
                     if tag:
                         tags.add(tag)
 
-        # Filter out obvious non-tags (dealer/navigation terms)
-        exclude_terms = ['dealer', 'dealership', 'inventory', 'home', 'about', 'contact']
-        filtered_tags = []
-        for tag in tags:
-            tag_lower = tag.lower()
-            is_excluded = any(term in tag_lower for term in exclude_terms)
-            if not is_excluded and len(tag.split()) <= 5:  # Tags are usually short
-                filtered_tags.append(tag)
+        # Meta fallback (article:tag — WordPress often sets these)
+        for meta in soup.find_all('meta', property='article:tag'):
+            if isinstance(meta, Tag):
+                content = meta.get('content')
+                if content:
+                    tags.add(str(content).strip())
 
-        return filtered_tags
+        exclude_terms = ['dealer', 'dealership', 'inventory', 'home', 'about', 'contact']
+        return [
+            tag for tag in tags
+            if not any(t in tag.lower() for t in exclude_terms)
+            and len(tag.split()) <= 5
+        ]
 
     def extract_title(self, soup: BeautifulSoup) -> str:
         """Extract post title"""
@@ -1552,181 +1186,6 @@ class BlogExtractor:
         self.extracted_data.append(data)
         return data
 
-    async def extract_blog_data_async(self, url: str) -> Dict[str, Any]:
-        """Async version: Extract all blog data from a URL"""
-        self._log("info", f"Processing: {url}")
-
-        # Fetch content asynchronously
-        html_content = await self.fetch_content_async(url)
-        if not html_content:
-            return {
-                'status': 'failed',
-                'url': url,
-                'error': 'Could not fetch content'
-            }
-
-        # Parse HTML (synchronous, but fast)
-        soup = BeautifulSoup(html_content, 'html.parser')
-
-        # Detect platform
-        platform = self.detect_platform(soup)
-
-        # Extract data (all synchronous, but fast)
-        # IMPORTANT: Extract categories/tags BEFORE extract_content,
-        # because extract_content removes postmetadata elements
-        title = self.extract_title(soup)
-        author = self.extract_author(soup)
-        date = self.extract_date(soup, url)
-        categories = self.extract_categories(soup)
-        tags = self.extract_tags(soup)
-
-        # Extract content AFTER categories/tags (modifies soup)
-        content = self.extract_content(soup)
-        links = self.extract_links(soup, url)
-
-        # Check for duplicate content
-        if content:
-            content_hash = self.get_content_hash(content)
-            if content_hash in self.seen_hashes:
-                if self.skip_duplicates:
-                    self._log("warning", "  [WARNING] Duplicate content detected - skipping")
-                    return {
-                        'status': 'duplicate',
-                        'url': url,
-                        'title': title,
-                        'error': 'Duplicate content'
-                    }
-                else:
-                    self._log("warning", "  [WARNING] Duplicate content detected - including anyway")
-            self.seen_hashes.add(content_hash)
-
-        # Calculate text length for display (strip HTML tags for counting)
-        text_for_counting = BeautifulSoup(content, 'html.parser').get_text() if content else ""
-
-        # Extract image URLs from content for WordPress attachments
-        images = self.extract_images_from_content(content) if self.include_images else []
-
-        # Download images asynchronously if enabled
-        if self.download_images and images:
-            image_urls = [img['src'] for img in images]
-            await self._batch_download_images_async(image_urls)
-
-        data = {
-            'status': 'success',
-            'url': url,
-            'title': title,
-            'content': content,
-            'content_length': len(text_for_counting.strip()),
-            'author': author,
-            'date': date,
-            'categories': categories,
-            'tags': tags,
-            'links': links,
-            'platform': platform,
-            'images': images,  # Add images for WordPress attachment items
-        }
-
-        self.extracted_data.append(data)
-        return data
-
-    async def _extract_with_semaphore(self, url: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-        """Extract blog data with semaphore to limit concurrent requests"""
-        async with semaphore:
-            return await self.extract_blog_data_async(url)
-
-    async def _batch_download_images_async(self, image_urls: List[str]) -> None:
-        """Batch download multiple images asynchronously for faster performance
-
-        Args:
-            image_urls: List of image URLs to download in parallel
-        """
-        if not self.download_images or not image_urls:
-            return
-
-        self._log("info", f"  Downloading {len(image_urls)} images in parallel...")
-
-        # Create aiohttp session for reusing connections
-        async with aiohttp.ClientSession() as session:
-            # Download all images concurrently
-            download_tasks = [
-                self._download_image_async(url, session)
-                for url in image_urls
-                if url not in self.downloaded_images  # Skip already downloaded
-            ]
-
-            if download_tasks:
-                await asyncio.gather(*download_tasks, return_exceptions=True)
-
-    async def process_urls_concurrently(self, urls: List[str], max_concurrent: int = 5, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> List[Dict[str, Any]]:
-        """Process multiple URLs concurrently with rate limiting
-
-        Now includes async image downloads for significantly faster performance.
-        Supports progress callbacks for real-time progress tracking.
-
-        Args:
-            urls: List of URLs to process
-            max_concurrent: Maximum number of concurrent requests
-            progress_callback: Optional callback function called after each URL completes
-        """
-        if not HAS_ASYNC_PLAYWRIGHT:
-            self._log("warning", "Async Playwright not available, falling back to sequential processing")
-            results = []
-            for url in urls:
-                result = self.extract_blog_data(url)
-                results.append(result)
-                if progress_callback:
-                    progress_callback(result)
-            return results
-
-        self._log("info", f"Processing {len(urls)} URLs with max {max_concurrent} concurrent requests...")
-
-        # Create semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        # Create tasks for all URLs
-        tasks = [self._extract_with_semaphore(url, semaphore) for url in urls]
-
-        # Run all tasks concurrently and update progress as they complete
-        processed_results: List[Dict[str, Any]] = []
-        completed_count = 0
-
-        for coro in asyncio.as_completed(tasks):
-            try:
-                result = await coro
-                processed_results.append(result)
-                completed_count += 1
-
-                # Log completion
-                status = result.get('status', 'unknown')
-                title = result.get('title', 'Unknown')[:50]
-                self._log("info", f"[{completed_count}/{len(urls)}] {status.upper()}: {title}")
-
-                # Call progress callback if provided
-                if progress_callback:
-                    try:
-                        progress_callback(result)
-                    except Exception as callback_error:
-                        self._log("warning", f"Progress callback error: {callback_error}")
-
-            except Exception as e:
-                self._log("error", f"Exception during processing: {e}")
-                completed_count += 1
-                processed_results.append({
-                    'status': 'failed',
-                    'url': 'unknown',
-                    'error': str(e)
-                })
-                if progress_callback:
-                    try:
-                        progress_callback({'status': 'failed', 'error': str(e)})
-                    except Exception as callback_error:
-                        self._log("warning", f"Progress callback error: {callback_error}")
-
-        # Cleanup shared browser resources
-        await self.close_browser()
-
-        return processed_results
-
     def load_urls(self) -> List[str]:
         """Load URLs from the input file with validation
 
@@ -1902,86 +1361,6 @@ class BlogExtractor:
             # Cache the result
             self.downloaded_images[img_url] = local_path
             self._log("info", f"  Saved: {filename} ({bytes_downloaded:,} bytes)")
-
-            return local_path
-
-        except Exception as e:
-            self._log("warning", f"  Failed to download image {img_url[:60]}...: {e}")
-            return None
-
-    async def _download_image_async(self, img_url: str, session: aiohttp.ClientSession) -> Optional[str]:
-        """Async version: Download image to local directory and return local file path
-
-        Significantly faster in concurrent mode as multiple images can download in parallel.
-
-        Args:
-            img_url: Image URL to download
-            session: aiohttp ClientSession for reusing connections
-
-        Returns:
-            Local file path if successful, None if download failed
-        """
-        if not self.download_images:
-            return None
-
-        # Check if already downloaded
-        if img_url in self.downloaded_images:
-            return self.downloaded_images[img_url]
-
-        try:
-            # First resolve the URL if it's a dynamic endpoint (still sync for now)
-            resolved_url = self._resolve_image_url(img_url)
-
-            # Generate local filename from URL (with path traversal protection)
-            parsed = urlparse(resolved_url)
-            filename = Path(parsed.path).name  # Only filename, strips any path components
-
-            # Security: Validate filename to prevent path traversal
-            if not filename or '..' in filename or filename.startswith(('/', '\\')):
-                filename = hashlib.blake2s(resolved_url.encode()).hexdigest() + '.jpg'
-
-            # If no valid filename, generate from hash
-            if not filename or '.' not in filename:
-                filename = hashlib.blake2s(resolved_url.encode()).hexdigest() + '.jpg'
-
-            # Ensure unique filename
-            local_path = os.path.join(self.images_dir, filename)
-            counter = 1
-            base_name, ext = os.path.splitext(filename)
-            while os.path.exists(local_path):
-                filename = f"{base_name}_{counter}{ext}"
-                local_path = os.path.join(self.images_dir, filename)
-                counter += 1
-
-            # Download the image asynchronously
-            self._log("debug", f"  Downloading image: {filename}")
-            async with session.get(resolved_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                response.raise_for_status()
-
-                # Save to file asynchronously and track size (with limit to prevent disk fill)
-                bytes_downloaded = 0
-                async with aiofiles.open(local_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
-                        bytes_downloaded += len(chunk)
-
-                        # Check size limit to prevent disk fill attacks
-                        if bytes_downloaded > MAX_IMAGE_SIZE:
-                            raise ValueError(f"Image exceeds size limit: {bytes_downloaded / 1024 / 1024:.1f}MB > {MAX_IMAGE_SIZE / 1024 / 1024}MB")
-
-                        await f.write(chunk)
-
-            # Validate image file type
-            kind = filetype.guess(local_path)
-            if kind is None:
-                self._log("warning", f"  Could not determine file type for {filename}, keeping anyway")
-            elif kind.mime.startswith('image/'):
-                self._log("debug", f"  Validated image: {filename} ({kind.mime})")
-            else:
-                self._log("warning", f"  Downloaded file is not an image: {filename} ({kind.mime})")
-
-            # Cache the result
-            self.downloaded_images[img_url] = local_path
-            self._log("debug", f"  Saved: {filename} ({bytes_downloaded:,} bytes)")
 
             return local_path
 
@@ -2414,141 +1793,3 @@ class BlogExtractor:
 
         self._log("info", f"CSV saved to: {output_path}")
 
-    def get_xml_content(self) -> str:
-        """Generate and return WordPress XML content as string"""
-        output = io.StringIO()
-        self._write_xml_header(output)
-
-        for post in self.extracted_data:
-            if post['status'] == 'success':
-                self._write_xml_post(output, post)
-
-        self._write_xml_footer(output)
-        return output.getvalue()
-
-    def get_json_content(self) -> str:
-        """Generate and return JSON content as string"""
-        json_data: Dict[str, Any] = {
-            'export_date': datetime.now().isoformat(),
-            'total_posts': len([p for p in self.extracted_data if p['status'] == 'success']),
-            'posts': []
-        }
-
-        for post in self.extracted_data:
-            if post['status'] == 'success':
-                json_post = {
-                    'url': post['url'],
-                    'title': post['title'],
-                    'author': post['author'],
-                    'date': post['date'],
-                    'platform': post.get('platform', 'unknown'),
-                    'content': post['content'],
-                    'content_length': post['content_length'],
-                    'categories': post['categories'],
-                    'tags': post['tags'],
-                    'links': post.get('links', [])
-                }
-                json_data['posts'].append(json_post)
-
-        return json.dumps(json_data, ensure_ascii=False, indent=2)
-
-    def get_csv_content(self) -> str:
-        """Generate and return CSV content as string"""
-        output = io.StringIO()
-        fieldnames = ['url', 'title', 'author', 'date', 'platform', 'content_length',
-                     'categories', 'tags', 'links_count', 'content']
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for post in self.extracted_data:
-            if post['status'] == 'success':
-                csv_row = {
-                    'url': post['url'],
-                    'title': post['title'],
-                    'author': post['author'],
-                    'date': post['date'],
-                    'platform': post.get('platform', 'unknown'),
-                    'content_length': post['content_length'],
-                    'categories': ', '.join(post['categories']),
-                    'tags': ', '.join(post['tags']),
-                    'links_count': len(post.get('links', [])),
-                    'content': post['content']
-                }
-                writer.writerow(csv_row)
-
-        return output.getvalue()
-
-    def get_links_content(self) -> str:
-        """Generate and return links content as string"""
-        output = io.StringIO()
-        output.write("# Extracted Hyperlinks from Blog Posts\n")
-        output.write("# Format: [Post Title] Link Text -> URL\n\n")
-
-        for post in self.extracted_data:
-            if post['status'] == 'success' and post.get('links'):
-                output.write(f"## {post['title']}\n")
-                output.write(f"Source: {post['url']}\n\n")
-
-                for link in post['links']:
-                    output.write(f"{link['text']} -> {link['url']}\n")
-
-                output.write("\n" + "="*80 + "\n\n")
-
-        return output.getvalue()
-
-
-def main():
-    """Main function for CLI usage"""
-    extractor = BlogExtractor()
-    urls = extractor.load_urls()
-
-    if not urls:
-        extractor._log("warning", "No URLs to process")
-        return
-
-    extractor._log("info", f"Processing {len(urls)} URLs with Playwright...")
-    success_count = 0
-    duplicate_count = 0
-
-    for i, url in enumerate(urls, 1):
-        extractor._log("info", f"\n[{i}/{len(urls)}] Processing...")
-        data = extractor.extract_blog_data(url)
-
-        if data['status'] == 'success':
-            extractor._log("info", f"[OK] Success: {data['title']}")
-            extractor._log("info", f"  URL: {data['url']}")
-            extractor._log("info", f"  Date: {data['date']}")
-            extractor._log("info", f"  Author: {data['author']}")
-            extractor._log("info", f"  Content: {data['content_length']} characters")
-            extractor._log("info", f"  Links: {len(data.get('links', []))} found")
-            if data['categories']:
-                extractor._log("info", f"  Categories: {', '.join(data['categories'])}")
-            if data['tags']:
-                extractor._log("info", f"  Tags: {', '.join(data['tags'])}")
-            success_count += 1
-        elif data['status'] == 'duplicate':
-            extractor._log("warning", f"[SKIP] Duplicate: {data['title']}")
-            duplicate_count += 1
-        else:
-            extractor._log("error", f"[FAIL] Failed - {data.get('error', 'Unknown error')}")
-
-        # Delay between requests
-        if i < len(urls):
-            time.sleep(REQUEST_DELAY)
-
-    # Save results
-    if extractor.extracted_data:
-        extractor.save_to_xml("blog_posts.xml")
-        extractor.save_links_to_txt("extracted_links.txt")
-
-    extractor._log("info", "\n=== Summary ===")
-    extractor._log("info", f"Total URLs: {len(urls)}")
-    extractor._log("info", f"Successful: {success_count}")
-    extractor._log("info", f"Duplicates: {duplicate_count}")
-    extractor._log("info", f"Failed: {len(urls) - success_count - duplicate_count}")
-    if len(urls) > 0:
-        extractor._log("info", f"Success rate: {success_count/len(urls)*100:.1f}%")
-
-
-if __name__ == "__main__":
-    main()
