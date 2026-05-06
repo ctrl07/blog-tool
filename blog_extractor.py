@@ -218,7 +218,6 @@ class BlogExtractor:
                     pass
 
                 # Scroll to trigger lazy-loaded images using native Playwright API
-                self._log("info", "  Scrolling to load lazy images...")
                 try:
                     viewport_height = page.evaluate("window.innerHeight")
                     scroll_height = page.evaluate("document.body.scrollHeight")
@@ -230,20 +229,19 @@ class BlogExtractor:
 
                     page.evaluate("window.scrollTo(0, 0)")
                 except Exception as e:
-                    self._log("warning", f"  Scroll failed: {e}, continuing...")
+                    self._log("warning", f"Scroll failed: {e}")
 
                 html_content = cast(str, page.content())
                 return html_content
 
             except Exception as e:
-                self._log("warning", f"  CDP attempt {attempt + 1} failed: {e}")
+                self._log("error", f"CDP fetch failed: {e}")
                 self._browser = None  # Force reconnect on next attempt
                 if attempt < max_retries - 1:
                     delay = 2 ** attempt
-                    self._log("info", f"  Retrying in {delay}s...")
                     time.sleep(delay)
                 else:
-                    self._log("error", f"  All CDP attempts failed for {url}")
+                    self._log("error", f"All CDP attempts failed for {url}")
             finally:
                 if page:
                     try:
@@ -388,6 +386,25 @@ class BlogExtractor:
             if not any(t in tag.lower() for t in exclude_terms)
             and len(tag.split()) <= 5
         ]
+
+    def extract_title_tag(self, soup: BeautifulSoup) -> str:
+        """Extract the HTML <title> element text (may include site name)."""
+        tag = soup.find('title')
+        return tag.get_text().strip() if tag else ''
+
+    def extract_meta_description(self, soup: BeautifulSoup) -> str:
+        """Extract meta description from <meta name='description'> or og:description."""
+        for attrs in [
+            {'name': 'description'},
+            {'property': 'og:description'},
+            {'name': 'twitter:description'},
+        ]:
+            tag = soup.find('meta', attrs=attrs)
+            if tag and isinstance(tag, Tag):
+                content = tag.get('content', '')
+                if content:
+                    return str(content).strip()
+        return ''
 
     def extract_title(self, soup: BeautifulSoup) -> str:
         """Extract post title"""
@@ -1156,10 +1173,13 @@ class BlogExtractor:
         # IMPORTANT: Extract categories/tags BEFORE extract_content,
         # because extract_content removes postmetadata elements
         title = self.extract_title(soup)
+        title_tag = self.extract_title_tag(soup)
+        meta_description = self.extract_meta_description(soup)
         author = self.extract_author(soup)
         date = self.extract_date(soup, url)
         categories = self.extract_categories(soup)
         tags = self.extract_tags(soup)
+        slug = url.rstrip('/').split('/')[-1]
 
         # Extract content AFTER categories/tags (modifies soup)
         content = self.extract_content(soup)
@@ -1190,7 +1210,10 @@ class BlogExtractor:
         data = {
             'status': 'success',
             'url': url,
+            'slug': slug,
             'title': title,
+            'title_tag': title_tag,
+            'meta_description': meta_description,
             'content': content,
             'content_length': len(text_for_counting.strip()),
             'author': author,
@@ -1199,7 +1222,7 @@ class BlogExtractor:
             'tags': tags,
             'links': links,
             'platform': platform,
-            'images': images,  # Add images for WordPress attachment items
+            'images': images,
         }
 
         self.extracted_data.append(data)
