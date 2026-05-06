@@ -63,6 +63,8 @@ def main():
     if extractor.extracted_data:
         extractor.save_to_xml("blog_posts.xml")
 
+    extractor.close()
+
     failed = len(urls) - success_count - duplicate_count
     print(f"\nDone: {success_count} extracted, {duplicate_count} duplicates, {failed} failed")
     print(f"Output: output/blog_posts.xml")

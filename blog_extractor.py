@@ -83,6 +83,11 @@ class BlogExtractor:
         self.resolved_image_cache: Dict[str, str] = {}  # Cache for resolved image URLs
         self.downloaded_images: Dict[str, str] = {}  # Map original URL -> local file path
 
+        # Playwright session (reused across all URLs)
+        self._pw = None
+        self._browser = None
+        self._context = None
+
         # Create output directory if it doesn't exist
         Path(self.output_dir).mkdir(exist_ok=True)
 
@@ -91,6 +96,26 @@ class BlogExtractor:
         if self.download_images:
             Path(self.images_dir).mkdir(exist_ok=True)
 
+    def _connect(self) -> None:
+        """Connect to Chrome via CDP, reusing the session if already connected."""
+        if self._browser is not None and self._browser.is_connected():
+            return
+        if self._pw is None:
+            self._pw = sync_playwright().start()
+        self._log("info", f"Connecting to Chrome via CDP at {self.cdp_url}...")
+        self._browser = self._pw.chromium.connect_over_cdp(self.cdp_url)
+        self._context = self._browser.contexts[0]
+
+    def close(self) -> None:
+        """Stop Playwright session. Never closes the browser (user's Chrome)."""
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+        self._pw = None
+        self._browser = None
+        self._context = None
 
     def _log(self, level: str, message: str) -> None:
         """Log message to logger and optionally call callback for UI updates"""
@@ -169,56 +194,50 @@ class BlogExtractor:
         return 'generic'
 
     def fetch_content(self, url: str, max_retries: int = 3,
-                      scroll_interval: int = 600,
-                      settle_delay: int = 5000) -> Optional[str]:
+                      scroll_interval: int = 300) -> Optional[str]:
         """Fetch URL content via CDP — all requests go through the running Chrome instance."""
         for attempt in range(max_retries):
             page = None
             try:
-                with sync_playwright() as p:
-                    self._log("info", f"  Connecting to Chrome via CDP at {self.cdp_url} (attempt {attempt + 1}/{max_retries})...")
-                    browser = p.chromium.connect_over_cdp(self.cdp_url)
-                    context = browser.contexts[0]
-                    page = context.new_page()
-                    page.set_viewport_size({"width": 1920, "height": 1080})
+                self._connect()
+                assert self._context is not None
+                page = self._context.new_page()
+                page.set_viewport_size({"width": 1920, "height": 1080})
 
-                    # Bring tab to front and navigate
-                    page.bring_to_front()
-                    page.goto(url, wait_until="commit", timeout=30000)
+                # Bring tab to front and navigate
+                page.bring_to_front()
+                page.goto(url, wait_until="commit", timeout=30000)
 
-                    # Use screen CSS so layout/colours render as seen in browser
-                    page.emulate_media(media="screen")
+                # Use screen CSS so layout/colours render as seen in browser
+                page.emulate_media(media="screen")
 
-                    # Scroll to trigger lazy-loaded images (JS interval — same as miniwayback)
-                    self._log("info", "  Scrolling to load lazy images...")
-                    page.evaluate(f"""
-                        async () => {{
-                            await new Promise(resolve => {{
-                                const distance = window.innerHeight;
-                                let count = 0;
-                                const timer = setInterval(() => {{
-                                    window.scrollBy(0, distance);
-                                    count++;
-                                    const atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight;
-                                    if (atBottom && count >= 2) {{
-                                        clearInterval(timer);
-                                        window.scrollTo(0, 0);
-                                        resolve();
-                                    }}
-                                }}, {scroll_interval});
-                            }});
-                        }}
-                    """)
+                # Wait for DOM to be parsed before scrolling
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
 
-                    # Wait for dynamic content to settle
-                    self._log("info", f"  Waiting {settle_delay // 1000}s for page to settle...")
-                    page.wait_for_timeout(settle_delay)
+                # Scroll to trigger lazy-loaded images using native Playwright API
+                self._log("info", "  Scrolling to load lazy images...")
+                try:
+                    viewport_height = page.evaluate("window.innerHeight")
+                    scroll_height = page.evaluate("document.body.scrollHeight")
+                    steps = max(2, -(-scroll_height // viewport_height))
 
-                    html_content = cast(str, page.content())
-                    return html_content
+                    for _ in range(steps):
+                        page.mouse.wheel(0, viewport_height)
+                        page.wait_for_timeout(scroll_interval)
+
+                    page.evaluate("window.scrollTo(0, 0)")
+                except Exception as e:
+                    self._log("warning", f"  Scroll failed: {e}, continuing...")
+
+                html_content = cast(str, page.content())
+                return html_content
 
             except Exception as e:
                 self._log("warning", f"  CDP attempt {attempt + 1} failed: {e}")
+                self._browser = None  # Force reconnect on next attempt
                 if attempt < max_retries - 1:
                     delay = 2 ** attempt
                     self._log("info", f"  Retrying in {delay}s...")
