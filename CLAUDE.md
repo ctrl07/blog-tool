@@ -84,24 +84,26 @@ soup.find_all('a', rel='category tag')
 
 ### 5. CDP Page Lifecycle
 
-**Location:** `fetch_content()`
+**Location:** `fetch_content()`, `_connect()`, `close()`
 
-- Connect once per URL with `sync_playwright()` context manager
-- Get the existing context: `browser.contexts[0]`
-- Always close the **page** in `finally` — never close the browser (it's the user's Chrome)
+- Connect once via `_connect()` — reuses existing connection if already live, reconnects automatically if Chrome restarts
+- Get the existing context: `browser.contexts[0]` (stored in `self._context`)
+- Create a new **page** per URL, close it in `finally` — never close the browser (it's the user's Chrome)
 - `page.bring_to_front()` before `goto` so the tab is visible and rendering correctly
+- Call `extractor.close()` at end to stop Playwright session (in `extract.py`)
 
 ---
 
 ## Fetch Behaviour
 
-`fetch_content()` follows the miniwayback pattern:
+`fetch_content()` uses native Playwright methods:
 
 1. `page.bring_to_front()`
 2. `page.goto(url, wait_until="commit", timeout=30000)`
 3. `page.emulate_media(media="screen")` — screen CSS, not print
-4. JS `setInterval` scroll — scrolls by `window.innerHeight` until bottom, then back to top
-5. `page.wait_for_timeout(settle_delay)` — default 5 s after scrolling
+4. `page.wait_for_load_state("domcontentloaded")` — wait for DOM to be parsed
+5. `page.mouse.wheel()` loop (300ms intervals) — scrolls by `window.innerHeight` until bottom, then back to top (triggers IntersectionObserver lazy-loading)
+6. Immediately returns HTML — scroll provides sufficient delay for lazy images
 
 ---
 
