@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Blog Extractor - reads URLs from urls.txt and outputs WordPress XML to output/blog_posts.xml
+Blog Extractor - reads URLs from urls.txt and outputs CSV + optional XML
 
 Usage:
-    python extract.py                          # default CDP at http://localhost:9222
+    python extract.py                          # CSV + HTML files (default)
+    python extract.py --xml                    # also export WordPress XML
+    python extract.py --images-zip             # also download images as ZIP
     python extract.py --cdp-url http://host:9222
 
 Chrome must be running with remote debugging enabled:
     chrome.exe --remote-debugging-port=9222 --user-data-dir=C:/chrome-debug
 """
-
+import re
 import csv
 import sys
 import logging
@@ -34,13 +36,13 @@ logging.basicConfig(
 
 
 def save_to_csv(posts: list, output_dir: str) -> str:
-    """Write extracted post data to a CSV file. Returns the output path."""
+    """Write extracted post data to CSV. Returns output path."""
     path = Path(output_dir) / 'blog_posts.csv'
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
             'url', 'slug', 'title', 'title_tag', 'meta_description',
-            'date', 'categories', 'tags', 'images', 'links',
+            'date', 'categories', 'tags', 'images', 'links', 'content',
         ])
         for post in posts:
             if post['status'] != 'success':
@@ -56,12 +58,54 @@ def save_to_csv(posts: list, output_dir: str) -> str:
                 ' | '.join(post.get('tags', [])),
                 ' | '.join(img['src'] for img in post.get('images', [])),
                 ' | '.join(lnk['url'] for lnk in post.get('links', [])),
+                post.get('content', ''),
             ])
     return str(path)
 
 
+def save_html_files(posts: list, output_dir: str) -> str:
+    """Save each post's content as an individual HTML file. Returns directory path."""
+    html_dir = Path(output_dir) / 'html'
+    html_dir.mkdir(exist_ok=True)
+
+    for post in posts:
+        if post['status'] != 'success':
+            continue
+
+        slug = post.get('slug') or re.sub(r'[^\w\-]', '_', post.get('title', 'post'))
+        title = post.get('title', '')
+        content = post.get('content', '')
+        date = post.get('date', '')
+        url = post.get('url', '')
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="description" content="{post.get('meta_description', '')}">
+  <title>{title}</title>
+</head>
+<body>
+  <!-- source: {url} | date: {date} -->
+  <h1>{title}</h1>
+  {content}
+</body>
+</html>"""
+
+        filename = html_dir / f"{slug}.html"
+        # Avoid overwriting if slug collision
+        counter = 1
+        while filename.exists():
+            filename = html_dir / f"{slug}_{counter}.html"
+            counter += 1
+
+        filename.write_text(html, encoding='utf-8')
+
+    return str(html_dir)
+
+
 def download_images_zip(posts: list, output_dir: str) -> str | None:
-    """Download all unique image URLs from all posts and save as a zip. Returns zip path."""
+    """Download all unique image URLs and save as a zip. Returns zip path."""
     seen: set = set()
     entries: list[tuple[str, bytes]] = []
 
@@ -69,7 +113,7 @@ def download_images_zip(posts: list, output_dir: str) -> str | None:
         if post['status'] != 'success':
             continue
         for img in post.get('images', []):
-            src = img.get('src', '').split('?')[0]  # strip query params
+            src = img.get('src', '').split('?')[0]
             if not src or src in seen:
                 continue
             seen.add(src)
@@ -77,7 +121,6 @@ def download_images_zip(posts: list, output_dir: str) -> str | None:
                 resp = requests.get(img['src'], timeout=15, stream=True)
                 resp.raise_for_status()
                 filename = Path(urlparse(src).path).name or 'image'
-                # Deduplicate filenames
                 base, ext = (filename.rsplit('.', 1) + [''])[:2]
                 safe_name = re.sub(r'[^\w.\-]', '_', filename)
                 count = sum(1 for n, _ in entries if n.startswith(base))
@@ -100,11 +143,11 @@ def download_images_zip(posts: list, output_dir: str) -> str | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract blog posts to WordPress XML')
+    parser = argparse.ArgumentParser(description='Extract blog posts to CSV + HTML')
     parser.add_argument('--cdp-url', default='http://localhost:9222',
                         help='Chrome CDP endpoint (default: http://localhost:9222)')
-    parser.add_argument('--csv', action='store_true',
-                        help='Export post metadata to output/blog_posts.csv')
+    parser.add_argument('--xml', action='store_true',
+                        help='Also export WordPress XML to output/blog_posts.xml')
     parser.add_argument('--images-zip', action='store_true',
                         help='Download all images and save to output/images.zip')
     args = parser.parse_args()
@@ -137,11 +180,15 @@ def main():
             time.sleep(REQUEST_DELAY)
 
     if extractor.extracted_data:
-        extractor.save_to_xml("blog_posts.xml")
+        csv_path = save_to_csv(extractor.extracted_data, extractor.output_dir)
+        print(f"\nCSV:    {csv_path}")
 
-        if args.csv:
-            csv_path = save_to_csv(extractor.extracted_data, extractor.output_dir)
-            print(f"CSV:    {csv_path}")
+        html_dir = save_html_files(extractor.extracted_data, extractor.output_dir)
+        print(f"HTML:   {html_dir}/")
+
+        if args.xml:
+            extractor.save_to_xml("blog_posts.xml")
+            print(f"XML:    output/blog_posts.xml")
 
         if args.images_zip:
             print("\nDownloading images...")
@@ -155,7 +202,6 @@ def main():
 
     failed = len(urls) - success_count - duplicate_count
     print(f"\nDone: {success_count} extracted, {duplicate_count} duplicates, {failed} failed")
-    print(f"XML:    output/blog_posts.xml")
     return 0 if failed == 0 else 1
 
 

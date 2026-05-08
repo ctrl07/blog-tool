@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 title Blog Extractor
 
-:: ── Install uv if missing ──────────────────────────────────────────────────
+:: Install uv if missing 
 where uv >NUL 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo Installing uv...
@@ -14,7 +14,16 @@ if %ERRORLEVEL% NEQ 0 (
     )
 )
 
-:: ── Sync dependencies ──────────────────────────────────────────────────────
+:: Install Python 3.13 if missing
+echo Checking Python 3.13...
+uv python install 3.13 --quiet
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Failed to install Python 3.13. Check your internet connection.
+    pause
+    exit /b 1
+)
+
+:: Sync dependencies
 echo Installing dependencies...
 uv sync --quiet
 if %ERRORLEVEL% NEQ 0 (
@@ -23,11 +32,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-:: ── Install Playwright Chromium browser (once) ────────────────────────────
-echo Checking Playwright browser...
-uv run playwright install chromium --quiet 2>nul
-
-:: ── Find Chrome ────────────────────────────────────────────────────────────
+:: Find Chrome
 set CHROME=
 for %%P in (
     "%ProgramFiles%\Google\Chrome\Application\chrome.exe"
@@ -45,15 +50,15 @@ if "!CHROME!"=="" (
     exit /b 1
 )
 
-:: ── Launch Chrome with remote debugging ───────────────────────────────────
+:: Launch Chrome with remote debugging
 echo Starting Chrome in remote debug mode on port 9222...
 start "" !CHROME! --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug
 timeout /t 3 /nobreak >NUL
 
-:: ── Run extractor ──────────────────────────────────────────────────────────
+:: Run extractor
 echo.
 echo Running Blog Extractor...
-uv run python extract.py
+uv run extract.py --xml --images-zip
 
 echo.
 pause
