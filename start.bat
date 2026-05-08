@@ -58,7 +58,7 @@ timeout /t 3 /nobreak >NUL
 :: Run extractor
 echo.
 echo Running Blog Extractor...
-uv run extract.py --xml --images-zip
+uv run extract.py --images-zip
 
 echo.
 pause
