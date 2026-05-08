@@ -153,6 +153,18 @@ def main():
     args = parser.parse_args()
 
     extractor = BlogExtractor(cdp_url=args.cdp_url)
+
+    # Add file handler — output dir is already created by BlogExtractor.__init__
+    log_path = Path(extractor.output_dir) / 'extract.log'
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    logging.getLogger().addHandler(fh)
+    logger.info("Log: %s", log_path)
+
     urls = extractor.load_urls()
 
     if not urls:
