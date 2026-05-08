@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Blog Extractor - reads URLs from urls.txt and outputs CSV + optional XML
+Blog Extractor - reads URLs from urls.txt
 
 Usage:
     python extract.py                          # CSV + HTML files (default)
@@ -33,6 +32,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logger = logging.getLogger(__name__)
 
 
 def save_to_csv(posts: list, output_dir: str) -> str:
@@ -127,9 +127,9 @@ def download_images_zip(posts: list, output_dir: str) -> str | None:
                 if count:
                     safe_name = f"{base}_{count}.{ext}"
                 entries.append((safe_name, resp.content))
-                print(f"  Downloaded: {safe_name}")
+                logger.info("Downloaded: %s", safe_name)
             except Exception as e:
-                print(f"  WARN: Could not download {img['src']}: {e}")
+                logger.warning("Could not download %s: %s", img['src'], e)
 
     if not entries:
         return None
@@ -156,52 +156,51 @@ def main():
     urls = extractor.load_urls()
 
     if not urls:
-        print("No URLs found in urls.txt")
+        logger.error("No URLs found in urls.txt")
         return 1
 
-    print(f"Processing {len(urls)} URLs via Chrome at {args.cdp_url}...")
     success_count = 0
     duplicate_count = 0
 
     for i, url in enumerate(urls, 1):
-        print(f"\n[{i}/{len(urls)}] {url}")
+        logger.info("[%d/%d] %s", i, len(urls), url)
         data = extractor.extract_blog_data(url)
 
         if data['status'] == 'success':
-            print(f"  OK: {data['title']} ({data['content_length']} chars)")
+            logger.info("  OK: %s (%d chars)", data['title'], data['content_length'])
             success_count += 1
         elif data['status'] == 'duplicate':
-            print(f"  SKIP: duplicate")
+            logger.info("  SKIP: duplicate")
             duplicate_count += 1
         else:
-            print(f"  FAIL: {data.get('error', 'unknown error')}")
+            logger.error("  FAIL: %s", data.get('error', 'unknown error'))
 
         if i < len(urls):
             time.sleep(REQUEST_DELAY)
 
     if extractor.extracted_data:
         csv_path = save_to_csv(extractor.extracted_data, extractor.output_dir)
-        print(f"\nCSV:    {csv_path}")
+        logger.info("CSV:    %s", csv_path)
 
         html_dir = save_html_files(extractor.extracted_data, extractor.output_dir)
-        print(f"HTML:   {html_dir}/")
+        logger.info("HTML:   %s/", html_dir)
 
         if args.xml:
             extractor.save_to_xml("blog_posts.xml")
-            print(f"XML:    output/blog_posts.xml")
+            logger.info("XML:    output/blog_posts.xml")
 
         if args.images_zip:
-            print("\nDownloading images...")
+            logger.info("Downloading images...")
             zip_path = download_images_zip(extractor.extracted_data, extractor.output_dir)
             if zip_path:
-                print(f"ZIP:    {zip_path}")
+                logger.info("ZIP:    %s", zip_path)
             else:
-                print("No images to download.")
+                logger.info("No images to download.")
 
     extractor.close()
 
     failed = len(urls) - success_count - duplicate_count
-    print(f"\nDone: {success_count} extracted, {duplicate_count} duplicates, {failed} failed")
+    logger.info("Done: %d extracted, %d duplicates, %d failed", success_count, duplicate_count, failed)
     return 0 if failed == 0 else 1
 
 
