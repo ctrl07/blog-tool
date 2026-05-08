@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Blog Content Extractor
 Extracts blog posts from URLs and converts to WordPress XML.
@@ -45,12 +44,6 @@ OUTPUT_DIR = "output"
 REQUEST_DELAY = 2  # seconds between requests
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB - prevent disk fill attacks
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +55,6 @@ class BlogExtractor:
         urls_file: str = URLS_FILE,
         output_dir: str = OUTPUT_DIR,
         callback: Optional[Callable[[str, str], None]] = None,
-        verbose: bool = True,
         relative_links: bool = False,
         include_images: bool = True,
         skip_duplicates: bool = True,
@@ -73,7 +65,6 @@ class BlogExtractor:
         self.output_dir = output_dir
         self.extracted_data: List[Dict[str, Any]] = []
         self.callback = callback  # Optional callback for UI updates (level, message)
-        self.verbose = verbose
         self.relative_links = relative_links  # Keep internal links relative in XML output
         self.include_images = include_images  # Include images in exported content
         self.skip_duplicates = skip_duplicates  # Skip duplicate content (default True)
@@ -118,23 +109,11 @@ class BlogExtractor:
         self._context = None
 
     def _log(self, level: str, message: str) -> None:
-        """Log message to logger and optionally call callback for UI updates"""
-        # Log to standard logger
+        """Log message via standard logger; optionally forward to UI callback."""
         log_level = getattr(logging, level.upper(), logging.INFO)
         logger.log(log_level, message)
-
-        # Call callback if provided (for Streamlit or other UIs)
         if self.callback:
             self.callback(level, message)
-
-        # Print to stdout if verbose (for CLI compatibility)
-        elif self.verbose:
-            # Handle Unicode encoding issues on Windows console (cp1252)
-            try:
-                print(message)
-            except UnicodeEncodeError:
-                # Fallback: encode with error replacement for console display
-                print(message.encode('ascii', errors='replace').decode('ascii'))
 
     def get_content_hash(self, content: str) -> str:
         """Generate blake2s hash of content for duplicate detection (FIPS-compliant)"""
@@ -149,29 +128,29 @@ class BlogExtractor:
             if content_attr:
                 content = str(content_attr).lower()
                 if 'wix' in content:
-                    self._log("info", "  Detected platform: Wix")
+                    self._log("debug", "Detected platform: Wix")
                     return 'wix'
                 if 'wordpress' in content:
-                    self._log("info", "  Detected platform: WordPress")
+                    self._log("debug", "Detected platform: WordPress")
                     return 'wordpress'
                 if 'medium' in content:
-                    self._log("info", "  Detected platform: Medium")
+                    self._log("debug", "Detected platform: Medium")
                     return 'medium'
                 if 'squarespace' in content:
-                    self._log("info", "  Detected platform: Squarespace")
+                    self._log("debug", "Detected platform: Squarespace")
                     return 'squarespace'
                 if 'blogger' in content:
-                    self._log("info", "  Detected platform: Blogger")
+                    self._log("debug", "Detected platform: Blogger")
                     return 'blogger'
 
         # Check for platform-specific attributes/classes
         if soup.find(attrs={'data-hook': True}):  # Wix signature
-            self._log("info", "  Detected platform: Wix (via data-hook)")
+            self._log("debug", "Detected platform: Wix (via data-hook)")
             return 'wix'
 
         # Webflow - check for data-wf-domain or data-wf-page attributes
         if soup.find(attrs={'data-wf-domain': True}) or soup.find(attrs={'data-wf-page': True}):
-            self._log("info", "  Detected platform: Webflow")
+            self._log("debug", "Detected platform: Webflow")
             return 'webflow'
 
         # WordPress classes - check for any element with wp- prefix in class
@@ -182,19 +161,19 @@ class BlogExtractor:
                 if classes and isinstance(classes, list):
                     for cls in classes:
                         if isinstance(cls, str) and cls.startswith('wp-'):
-                            self._log("info", "  Detected platform: WordPress (via wp- classes)")
+                            self._log("debug", "Detected platform: WordPress (via wp- classes)")
                             return 'wordpress'
 
         if soup.find('article', attrs={'data-post-id': True}):  # Medium
-            self._log("info", "  Detected platform: Medium (via data-post-id)")
+            self._log("debug", "Detected platform: Medium (via data-post-id)")
             return 'medium'
 
         # Default to generic
-        self._log("info", "  Platform: Generic (no specific platform detected)")
+        self._log("debug", "Platform: generic")
         return 'generic'
 
     def fetch_content(self, url: str, max_retries: int = 3,
-                      scroll_interval: int = 300) -> Optional[str]:
+                      scroll_interval: int = 600) -> Optional[str]:
         """Fetch URL content via CDP — all requests go through the running Chrome instance."""
         for attempt in range(max_retries):
             page = None
@@ -812,7 +791,7 @@ class BlogExtractor:
                     # Flush any accumulated inline content first
                     if current_paragraph_parts:
                         para_content = ''.join(str(p) for p in current_paragraph_parts)
-                        gutenberg_blocks.append(f'<!-- wp:paragraph -->\n<p>{para_content}</p>\n<!-- /wp:paragraph -->')
+                        gutenberg_blocks.append(f'\n<p>{para_content}</p>\n')
                         current_paragraph_parts = []
 
                     # Process the block element
@@ -823,7 +802,7 @@ class BlogExtractor:
                     # Button links are separate blocks
                     if current_paragraph_parts:
                         para_content = ''.join(str(p) for p in current_paragraph_parts)
-                        gutenberg_blocks.append(f'<!-- wp:paragraph -->\n<p>{para_content}</p>\n<!-- /wp:paragraph -->')
+                        gutenberg_blocks.append(f'\n<p>{para_content}</p>\n')
                         current_paragraph_parts = []
 
                     block_html = self.element_to_gutenberg_block(element)
@@ -841,7 +820,7 @@ class BlogExtractor:
         # Flush any remaining inline content
         if current_paragraph_parts:
             para_content = ''.join(str(p) for p in current_paragraph_parts)
-            gutenberg_blocks.append(f'<!-- wp:paragraph -->\n<p>{para_content}</p>\n<!-- /wp:paragraph -->')
+            gutenberg_blocks.append(f'\n<p>{para_content}</p>\n')
 
         return '\n\n'.join(gutenberg_blocks)
 
@@ -858,32 +837,32 @@ class BlogExtractor:
                 button_html = str(element_copy)
             else:
                 button_html = str(element)
-            return f'<!-- wp:html -->\n{button_html}\n<!-- /wp:html -->'
+            return f'\n{button_html}\n'
 
         elif tag_name == 'p':
             content = str(element)
-            return f'<!-- wp:paragraph -->\n{content}\n<!-- /wp:paragraph -->'
+            return f'\n{content}\n'
 
         elif tag_name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
             level = int(tag_name[1])
             content = str(element)
-            return f'<!-- wp:heading {{"level":{level}}} -->\n{content}\n<!-- /wp:heading -->'
+            return f'\n{content}\n'
 
         elif tag_name in ['ul', 'ol']:
             content = str(element)
-            return f'<!-- wp:list -->\n{content}\n<!-- /wp:list -->'
+            return f'\n{content}\n'
 
         elif tag_name == 'blockquote':
             inner_content = element.decode_contents()
-            return f'<!-- wp:quote -->\n<blockquote class="wp-block-quote">{inner_content}</blockquote>\n<!-- /wp:quote -->'
+            return f'\n<blockquote class="wp-block-quote">{inner_content}</blockquote>\n'
 
         elif tag_name == 'pre':
             if element.find('code'):
                 content = element.get_text()
-                return f'<!-- wp:code -->\n<pre class="wp-block-code"><code>{content}</code></pre>\n<!-- /wp:code -->'
+                return f'\n<pre class="wp-block-code"><code>{content}</code></pre>\n'
             else:
                 content = str(element)
-                return f'<!-- wp:preformatted -->\n{content}\n<!-- /wp:preformatted -->'
+                return f'\n{content}\n'
 
         elif tag_name == 'img':
             # Create WordPress-native image block format (matches what WordPress generates)
@@ -906,7 +885,7 @@ class BlogExtractor:
                     img_html = f'<img src="{src}"/>'
 
                 # Simple Gutenberg image block without JSON attributes
-                return f'<!-- wp:image -->\n<figure class="wp-block-image">{img_html}</figure>\n<!-- /wp:image -->'
+                return f'\n<figure class="wp-block-image">{img_html}</figure>\n'
             return ""
 
         else:
@@ -914,13 +893,13 @@ class BlogExtractor:
             content = str(element)
             if tag_name in ['strong', 'em', 'u', 'a', 'code']:
                 # Inline elements - wrap in paragraph
-                return f'<!-- wp:paragraph -->\n<p>{content}</p>\n<!-- /wp:paragraph -->'
+                return f'\n<p>{content}</p>\n'
             elif tag_name == 'br':
                 # Skip br tags completely
                 return ""
             else:
                 # Block elements - wrap in paragraph
-                return f'<!-- wp:paragraph -->\n<p>{content}</p>\n<!-- /wp:paragraph -->'
+                return f'\n<p>{content}</p>\n'
 
     def extract_author(self, soup: BeautifulSoup) -> str:
         """Extract author information"""
@@ -1152,8 +1131,6 @@ class BlogExtractor:
 
     def extract_blog_data(self, url: str) -> Dict[str, Any]:
         """Extract all blog data from a URL"""
-        self._log("info", f"Processing: {url}")
-
         # Fetch content
         html_content = self.fetch_content(url)
         if not html_content:
@@ -1190,7 +1167,7 @@ class BlogExtractor:
             content_hash = self.get_content_hash(content)
             if content_hash in self.seen_hashes:
                 if self.skip_duplicates:
-                    self._log("warning", "  [WARNING] Duplicate content detected - skipping")
+                    self._log("warning", "Duplicate content detected - skipping")
                     return {
                         'status': 'duplicate',
                         'url': url,
@@ -1198,7 +1175,7 @@ class BlogExtractor:
                         'error': 'Duplicate content'
                     }
                 else:
-                    self._log("warning", "  [WARNING] Duplicate content detected - including anyway")
+                    self._log("warning", "Duplicate content detected - including anyway")
             self.seen_hashes.add(content_hash)
 
         # Calculate text length for display (strip HTML tags for counting)
@@ -1238,7 +1215,7 @@ class BlogExtractor:
         invalid_urls = []
 
         if not os.path.exists(self.urls_file):
-            self._log("error", f"Error: {self.urls_file} not found")
+            self._log("error", f"{self.urls_file} not found")
             return urls
 
         with open(self.urls_file, 'r', encoding='utf-8') as f:
