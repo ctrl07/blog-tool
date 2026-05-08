@@ -1,6 +1,6 @@
 # Blog Post Extractor
 
-Extract blog posts from any website and convert them to WordPress-compatible XML format.
+Extract blog posts from any website and export to CSV, HTML, and WordPress-compatible XML.
 
 **Supports:** WordPress, DealerOn, DealerInspire, Wix, Webflow, Blogger, Squarespace, and more!
 
@@ -11,9 +11,9 @@ Extract blog posts from any website and convert them to WordPress-compatible XML
 ### Windows
 
 1. **Double-click `start.bat`**
-2. Edit `urls.txt` and add your blog URLs (one per line)
+2. Edit `urls.txt` and add your blog post URLs (one per line)
 3. Wait for extraction to complete
-4. Find `output/blog_posts.xml` and import to WordPress
+4. Find your output in the `output/` folder
 
 That's it!
 
@@ -24,16 +24,16 @@ That's it!
 **What you need:**
 - Windows 10+
 - Google Chrome (must be installed)
-- Python 3.13+ (auto-detected)
+- Python 3.13+ (auto-detected via `uv`)
 
 **What `start.bat` does:**
-1. Auto-installs `uv` package manager (if missing)
-2. Installs Python dependencies from `pyproject.toml`
-3. Downloads Playwright browser components
-4. Launches Chrome with remote debugging
+1. Auto-installs `uv` package manager
+2. Installs Python 3.13 (if missing)
+3. Installs Python dependencies from `pyproject.toml`
+4. Launches Chrome with remote debugging on port 9222
 5. Runs the extraction tool
 
-Just double-click `start.bat` and wait 2-5 minutes for the first run.
+Just double-click `start.bat` and wait for the first run to complete.
 
 ---
 
@@ -49,52 +49,57 @@ https://example.com/blog/post-2
 https://example.com/blog/post-3
 ```
 
+Lines starting with `#` are treated as comments and skipped.
+
 ### Step 2: Run Extraction
 
 **Option A: Auto (Recommended)**
-```bash
+```
 Double-click start.bat
 ```
 
 **Option B: Manual**
 ```bash
-uv run python extract.py
+uv run extract.py
 ```
 
 ### Step 3: Get Output Files
 
 Files are saved to the `output/` folder:
 
-- **`blog_posts.xml`** — WordPress import file ✅
-- **`blog_posts.csv`** — (optional) Post metadata as CSV
-- **`images.zip`** — (optional) All blog images
+| File | Always? | Description |
+|---|---|---|
+| `blog_posts.csv` | Yes | Post metadata + content as spreadsheet |
+| `html/<slug>.html` | Yes | One HTML file per post (editable) |
+| `blog_posts.xml` | `--xml` flag | WordPress import file |
+| `images.zip` | `--images-zip` flag | All post images as a ZIP |
 
 ---
 
 ## CLI Options
 
 ```bash
-# Extract XML only
-uv run python extract.py
+# Default: CSV + HTML files
+uv run extract.py
 
-# Export post metadata to CSV
-uv run python extract.py --csv
+# Also export WordPress XML
+uv run extract.py --xml
 
-# Download all images as ZIP
-uv run python extract.py --images-zip
+# Also download all images as ZIP
+uv run extract.py --images-zip
 
-# Both CSV and images
-uv run python extract.py --csv --images-zip
+# Both XML and images
+uv run extract.py --xml --images-zip
 
 # Custom Chrome endpoint
-uv run python extract.py --cdp-url http://localhost:9223
+uv run extract.py --cdp-url http://localhost:9223
 ```
 
 ---
 
-## CSV Export (`--csv`)
+## CSV Output (always generated)
 
-One CSV file with post metadata:
+`output/blog_posts.csv` — one row per post:
 
 | Column | Description |
 |---|---|
@@ -107,23 +112,25 @@ One CSV file with post metadata:
 | categories | Post categories (pipe-separated) |
 | tags | Post tags (pipe-separated) |
 | images | Image URLs (pipe-separated) |
-| links | Hyperlinks in post (pipe-separated) |
+| links | Hyperlinks in post body (pipe-separated) |
+| content | Full post content (HTML) |
 
 ---
 
-## Image Download (`--images-zip`)
+## HTML Output (always generated)
 
-Downloads all unique images from extracted posts:
+`output/html/<slug>.html` — one file per post:
 
-- Deduplicates filenames
-- Saves to `output/images.zip`
-- Useful for archiving or bulk processing
+- Editable before importing to WordPress
+- Includes meta description in `<head>`
+- Source URL and date preserved as HTML comment
+- Slug collisions handled automatically (appends `_1`, `_2`, etc.)
 
 ---
 
-## Importing to WordPress
+## WordPress XML Export (`--xml`)
 
-Once extraction completes:
+`output/blog_posts.xml` — WordPress WXR format:
 
 1. Log into WordPress admin panel
 2. Go to **Tools → Import**
@@ -133,22 +140,29 @@ Once extraction completes:
 6. Assign authors (or create new ones)
 7. Check **"Download and import file attachments"** to import images
 8. Click **Submit**
-9. Done! Your posts are now in WordPress
+
+---
+
+## Image Download (`--images-zip`)
+
+`output/images.zip` — all unique images from extracted posts:
+
+- Deduplicates by URL (query strings stripped for comparison)
+- Safe filenames (special characters replaced)
+- Handles filename collisions automatically
 
 ---
 
 ## What Gets Extracted
 
-✅ Blog post titles & HTML `<title>` tag
-✅ Full content (text, images, formatting preserved)
-✅ Meta descriptions (SEO)
-✅ Author names
-✅ Publication dates
-✅ Categories and tags
-✅ All hyperlinks (internal and external)
-✅ All images (WordPress downloads them on import)
-
----
+- Blog post titles & HTML `<title>` tag
+- Full post content (HTML, formatting preserved)
+- Meta descriptions (SEO)
+- Author names
+- Publication dates
+- Categories and tags
+- All hyperlinks from post body
+- All images (referenced by URL; WordPress downloads on import)
 
 ## Troubleshooting
 
@@ -160,62 +174,43 @@ Once extraction completes:
 ### Dependencies installation fails
 **Error:** `[ERROR] Dependency install failed.`
 
-**Fix:** 
+**Fix:**
 - Check your internet connection
 - Run `start.bat` again
-- If still failing, run: `uv sync --upgrade`
+- If still failing: `uv sync --upgrade`
 
 ### Extraction is slow
-- Default: 2-5 seconds per URL (with scroll and DOM wait)
+- Default: 2 seconds between URLs, plus scroll time per page
 - This is normal for live browser extraction
-- Bulk jobs with 100+ URLs may take 5-15 minutes
+- Batch jobs with many URLs will take proportionally longer
 
 ### Images not appearing in WordPress
 - Make sure you checked **"Download and import file attachments"** during import
 - Images may take a few minutes to download after import
-- Use `--images-zip` flag to verify images were extracted
+- Use `--images-zip` to verify images were extracted before importing
 
 ### Website blocks extraction
 - Some sites detect and block automated scraping
-- Try again later (rate limiting)
+- Try again after a delay
 - Contact the website owner for API access if permanent
-
----
-
-## Output Files Reference
-
-| File | Purpose | Use Case |
-|---|---|---|
-| `blog_posts.xml` | WordPress import format | Import to WordPress |
-| `blog_posts.csv` | Post metadata spreadsheet | `--csv` flag |
-| `images.zip` | Downloaded images archive | `--images-zip` flag |
-
----
-
-## Requirements
-
-- **Windows 10+** (Windows only)
-- **Google Chrome** (v120+)
-- **Python 3.13+** (auto-detected)
-- **Internet connection** (for dependencies)
 
 ---
 
 ## How It Works
 
-The tool uses **Chrome's remote debugging protocol** to extract posts:
+The tool uses **Chrome's remote debugging protocol (CDP)** — it controls your actual Chrome browser, not a headless one:
 
-1. Launches your Chrome browser with debugging enabled
-2. Navigates to each URL
-3. Emulates screen CSS (not print styles)
+1. Connects to Chrome via CDP (port 9222)
+2. Opens a new tab for each URL
+3. Applies screen CSS (not print styles)
 4. Scrolls page to trigger lazy-loaded images
 5. Captures fully-rendered HTML
-6. Parses content using BeautifulSoup
-7. Converts to WordPress XML format
-8. Deduplicates posts by content hash
-9. Generates CSV/ZIP if requested
+6. Parses with BeautifulSoup
+7. Extracts title, metadata, content, images, links
+8. Deduplicates posts by content hash (blake2s)
+9. Saves CSV, HTML, and optionally XML/ZIP
 
-This approach ensures **all dynamic content and images load** before extraction, unlike simple HTTP scraping.
+This ensures **all dynamic content and images load** before extraction.
 
 ---
 
@@ -223,40 +218,49 @@ This approach ensures **all dynamic content and images load** before extraction,
 
 ### Run Chrome on a Different Port
 
-If port 9222 is already in use:
+If port 9222 is already in use, edit `start.bat`:
+
+```bat
+start "" !CHROME! --remote-debugging-port=9999 --user-data-dir=C:\chrome-debug
+```
+
+Then run with the matching port:
 
 ```bash
-# Edit start.bat line 50:
-start "" !CHROME! --remote-debugging-port=9999 --user-data-dir=C:\chrome-debug
-
-# Then run with matching port:
-uv run python extract.py --cdp-url http://localhost:9999
+uv run extract.py --cdp-url http://localhost:9999
 ```
 
 ### Re-run Without Re-installing
 
-After first run, you don't need to re-run `start.bat`. Just:
+After the first run, you can skip `start.bat` and run manually:
 
 ```bash
-# 1. Add URLs to urls.txt
-# 2. Launch Chrome manually:
+# 1. Launch Chrome with remote debugging
 chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug
 
-# 3. Run extraction:
-uv run python extract.py --csv --images-zip
+# 2. Edit urls.txt, then run:
+uv run extract.py --xml --images-zip
 ```
 
 ---
 
-## Version
+## Requirements
 
-**1.0.0** - Initial release
+- **Windows 10+**
+- **Google Chrome** (v120+)
+- **Internet connection** (first run only, for dependencies)
 
-- ✅ CDP-based extraction (live browser)
-- ✅ WordPress XML export
-- ✅ CSV metadata export
-- ✅ Image ZIP download
-- ✅ Multi-platform blog support
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `blog_extractor.py` | Core extraction engine |
+| `extract.py` | Blog post extractor entry point |
+| `start.bat` | One-click setup and run |
+| `pyproject.toml` | Python dependencies |
+| `urls.txt` | Input URLs (one per line) |
 
 ---
 
@@ -268,44 +272,26 @@ See [LICENSE](LICENSE) file for details.
 
 ---
 
-## Need Help?
-
-**Q: Can I extract from password-protected blogs?**
-A: No, blog posts must be publicly accessible.
-
-**Q: Can I move this folder?**
-A: Yes, move the entire folder anywhere. Everything is self-contained.
-
-**Q: How do I extract 1000+ posts?**
-A: Add all URLs to `urls.txt` and run extraction. It will process them sequentially (one at a time).
-
-**Q: What's the difference between XML and CSV output?**
-A: XML is for WordPress import. CSV is for spreadsheets/analysis with metadata (title, date, description, links, etc.).
-
-**Q: Do I need Chrome running already?**
-A: No! `start.bat` launches Chrome automatically.
-
----
-
 ## Quick Reference
 
 ```
 FIRST RUN:
-  Double-click start.bat (installs everything)
+  Double-click start.bat
 
 NEXT RUNS:
   1. Edit urls.txt
   2. Double-click start.bat
-  
-OR (manual):
-  uv run python extract.py
 
-WITH OPTIONS:
-  uv run python extract.py --csv --images-zip
+MANUAL:
+  uv run extract.py
+  uv run extract.py --xml --images-zip
 
 OUTPUT:
-  Check output/ folder for results
+  output/blog_posts.csv     — always
+  output/html/<slug>.html   — always
+  output/blog_posts.xml     — with --xml
+  output/images.zip         — with --images-zip
 
-IMPORT:
-  WordPress → Tools → Import → blog_posts.xml
+WORDPRESS IMPORT:
+  Tools → Import → WordPress → blog_posts.xml
 ```
